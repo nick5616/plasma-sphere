@@ -35,8 +35,8 @@ document.body.appendChild(renderer.domElement);
 // ─── Scene & Camera ───────────────────────────────────────────────────────────
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x000005);
-scene.fog = new THREE.Fog(0x000005, 12, 25);
+scene.background = new THREE.Color(0x1a0f2e);
+scene.fog = new THREE.Fog(0x1a0f2e, 10, 22);
 
 const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.01, 50);
 camera.position.set(0, SPHERE_Y + 0.6, 4.8);
@@ -66,7 +66,7 @@ controls.update();
 
 // ─── Lighting ─────────────────────────────────────────────────────────────────
 
-scene.add(new THREE.AmbientLight(0x110022, 2));
+scene.add(new THREE.AmbientLight(0x6655aa, 6));
 
 // Core light inside sphere — pulses with electricity
 const coreLight = new THREE.PointLight(0xaa55ff, 5, 3.5);
@@ -74,8 +74,14 @@ coreLight.position.set(0, SPHERE_Y, 0);
 scene.add(coreLight);
 
 // Subtle rim fill
-const rimLight = new THREE.PointLight(0x330066, 1.2, 10);
-rimLight.position.set(2, SPHERE_Y + 2, 2);
+// Off-axis key light — gives the glass sphere a visible specular highlight
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.8);
+keyLight.position.set(3, SPHERE_Y + 3, 4);
+scene.add(keyLight);
+
+// Rim/fill from opposite side
+const rimLight = new THREE.PointLight(0x9966ff, 3, 12);
+rimLight.position.set(-3, SPHERE_Y + 1.5, -2);
 scene.add(rimLight);
 
 // ─── Base ─────────────────────────────────────────────────────────────────────
@@ -118,7 +124,7 @@ const glassInner = new THREE.Mesh(
   new THREE.MeshPhysicalMaterial({
     color: 0x223366,
     transparent: true,
-    opacity: 0.06,
+    opacity: 0.18,
     side: THREE.BackSide,
     depthWrite: false,
   })
@@ -132,10 +138,10 @@ const glassOuter = new THREE.Mesh(
   new THREE.MeshPhysicalMaterial({
     color: 0x8899ee,
     transparent: true,
-    opacity: 0.1,
+    opacity: 0.28,
     roughness: 0.0,
     metalness: 0.0,
-    transmission: 0.88,
+    transmission: 0.82,
     thickness: 0.15,
     ior: 1.52,
     side: THREE.FrontSide,
@@ -151,7 +157,7 @@ const haloMesh = new THREE.Mesh(
   new THREE.MeshBasicMaterial({
     color: 0x5533cc,
     transparent: true,
-    opacity: 0.12,
+    opacity: 0.28,
     side: THREE.BackSide,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
@@ -164,11 +170,15 @@ scene.add(haloMesh);
 
 const metalMat = new THREE.MeshStandardMaterial({ color: 0x999999, metalness: 0.95, roughness: 0.08 });
 
-// Stem — runs from base top up through interior
+// Stem — runs from inside the base up to the electrode at sphere center
 {
-  const geo = new THREE.CylinderGeometry(0.022, 0.038, 0.6, 20);
+  // Average ring height × ring count gives the actual base top y
+  const baseTopY   = ((BASE_RING_H_BOT + BASE_RING_H_TOP) / 2) * BASE_RINGS; // ≈ 0.78
+  const stemBottom = baseTopY - 0.08; // sink slightly into base so there's no gap
+  const stemHeight = SPHERE_Y - stemBottom;
+  const geo  = new THREE.CylinderGeometry(0.022, 0.05, stemHeight, 40);
   const mesh = new THREE.Mesh(geo, metalMat);
-  mesh.position.set(0, SPHERE_Y - 0.32, 0);
+  mesh.position.set(0, stemBottom + stemHeight / 2, 0);
   scene.add(mesh);
 }
 
@@ -186,7 +196,7 @@ const coreGlow = new THREE.Mesh(
   new THREE.MeshBasicMaterial({
     color: 0xffffff,
     transparent: true,
-    opacity: 0.95,
+    opacity: 0.5,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
   })
@@ -263,38 +273,43 @@ function arcColor(t) {
 }
 
 /**
- * Create a TubeGeometry arc mesh with vertex color gradient.
- * The mesh is positioned so its local origin is the sphere center.
+ * Create a two-layer arc: a thin bright core + a wide transparent glow halo.
+ * Both use additive blending so bloom handles perceived brightness, not fill opacity.
+ * opacityMult scales both layers (use <1 for dimmed residual arcs).
  */
-function makeArcMesh(dir, tubeR = 0.008) {
+function makeArcMesh(dir, coreR = 0.003, opacityMult = 1.0) {
   const curve = buildArcCurve(dir);
-  const geo   = new THREE.TubeGeometry(curve, TUBULAR_SEGS, tubeR, RADIAL_SEGS, false);
 
-  const posAttr = geo.attributes.position;
-  const stride  = RADIAL_SEGS + 1;
-  const cols    = new Float32Array(posAttr.count * 3);
+  function buildTube(radius, baseOpacity) {
+    const geo    = new THREE.TubeGeometry(curve, TUBULAR_SEGS, radius, RADIAL_SEGS, false);
+    const stride = RADIAL_SEGS + 1;
+    const cols   = new Float32Array(geo.attributes.position.count * 3);
 
-  for (let i = 0; i < posAttr.count; i++) {
-    const seg = Math.floor(i / stride);
-    const t   = seg / TUBULAR_SEGS;
-    const c   = arcColor(t);
-    cols[i * 3]     = c.r;
-    cols[i * 3 + 1] = c.g;
-    cols[i * 3 + 2] = c.b;
+    for (let i = 0; i < geo.attributes.position.count; i++) {
+      const t = Math.floor(i / stride) / TUBULAR_SEGS;
+      const c = arcColor(t);
+      cols[i * 3]     = c.r;
+      cols[i * 3 + 1] = c.g;
+      cols[i * 3 + 2] = c.b;
+    }
+
+    geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      transparent: true,
+      opacity: baseOpacity * opacityMult,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    }));
+    mesh.position.set(0, SPHERE_Y, 0);
+    return mesh;
   }
 
-  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
-
-  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
-    vertexColors: true,
-    transparent: true,
-    opacity: 0.92,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-  }));
-
-  mesh.position.set(0, SPHERE_Y, 0);
-  return mesh;
+  const group = new THREE.Group();
+  group.add(buildTube(coreR,        0.75));  // sharp bright core
+  group.add(buildTube(coreR * 5.5,  0.04)); // wide feathery glow halo
+  return group;
 }
 
 // ─── Arc Group ────────────────────────────────────────────────────────────────
@@ -322,17 +337,30 @@ function jitteredDir(base, spread) {
 function regenerateArcs() {
   arcGroup.clear();
 
+  // When attracting: 80% of arcs follow the cursor, 20% stay random but dimmed.
+  // Without attraction everything is random at full brightness.
+  const total     = NUM_ARCS + NUM_THIN_ARCS; // 11
+  const attracted = attractDir ? Math.round(total * 0.8) : 0; // 9 when holding
+  const DIM       = 0.28; // opacityMult for residual random arcs
+
+  let assigned = 0;
+
   for (let i = 0; i < NUM_ARCS; i++) {
-    // All thick arcs converge on attract point; without it they spread randomly.
-    // Slight angular spread (0.13 rad ≈ 7°) keeps the bundle from looking copy-pasted.
-    const dir = attractDir ? jitteredDir(attractDir, 0.13) : randomDir();
-    arcGroup.add(makeArcMesh(dir, 0.009));
+    if (attractDir && assigned < attracted) {
+      arcGroup.add(makeArcMesh(jitteredDir(attractDir, 0.13), 0.004));
+      assigned++;
+    } else {
+      arcGroup.add(makeArcMesh(randomDir(), 0.004, attractDir ? DIM : 1.0));
+    }
   }
 
   for (let i = 0; i < NUM_THIN_ARCS; i++) {
-    // Thin accent arcs fan out a little more for a realistic fringe
-    const dir = attractDir ? jitteredDir(attractDir, 0.22) : randomDir();
-    arcGroup.add(makeArcMesh(dir, 0.003));
+    if (attractDir && assigned < attracted) {
+      arcGroup.add(makeArcMesh(jitteredDir(attractDir, 0.22), 0.002));
+      assigned++;
+    } else {
+      arcGroup.add(makeArcMesh(randomDir(), 0.002, attractDir ? DIM : 1.0));
+    }
   }
 }
 
