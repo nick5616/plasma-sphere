@@ -19,14 +19,15 @@ const BASE_RING_H_TOP = 0.065; // height of top ring
 // Arc settings
 const NUM_ARCS        = 7;   // main arcs
 const NUM_THIN_ARCS   = 4;   // accent arcs
-const REGEN_MS        = 85;  // arc flicker interval
-const TUBULAR_SEGS    = 55;
-const RADIAL_SEGS     = 5;
+const TOTAL_ARCS      = NUM_ARCS + NUM_THIN_ARCS;        // 11
+const ATTRACTED_COUNT = Math.round(TOTAL_ARCS * 0.8);    // 9 when holding
+const ARC_PTS         = 22;  // sample points per arc line
+const ARCS_PER_FRAME  = 2;   // how many arcs to refresh each frame (staggered)
 
 // ─── Renderer ─────────────────────────────────────────────────────────────────
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
@@ -99,7 +100,7 @@ for (let i = 0; i < BASE_RINGS; i++) {
   const r = THREE.MathUtils.lerp(BASE_BOTTOM_R, BASE_TOP_R, t);
   const h = THREE.MathUtils.lerp(BASE_RING_H_BOT, BASE_RING_H_TOP, t);
 
-  const geo = new THREE.CylinderGeometry(r, r, h, 80, 1);
+  const geo = new THREE.CylinderGeometry(r, r, h, 48, 1);
   const mesh = new THREE.Mesh(geo, baseMat);
   mesh.position.y = stackY + h / 2;
   scene.add(mesh);
@@ -108,7 +109,7 @@ for (let i = 0; i < BASE_RINGS; i++) {
 
 // Flat bottom disc
 {
-  const geo = new THREE.CylinderGeometry(BASE_BOTTOM_R, BASE_BOTTOM_R, 0.025, 80);
+  const geo = new THREE.CylinderGeometry(BASE_BOTTOM_R, BASE_BOTTOM_R, 0.025, 48);
   const mesh = new THREE.Mesh(geo, baseMat);
   mesh.position.y = 0.0125;
   scene.add(mesh);
@@ -116,7 +117,7 @@ for (let i = 0; i < BASE_RINGS; i++) {
 
 // ─── Glass Sphere ─────────────────────────────────────────────────────────────
 
-const sphereGeo = new THREE.SphereGeometry(SPHERE_R, 80, 80);
+const sphereGeo = new THREE.SphereGeometry(SPHERE_R, 48, 32);
 
 // Back face — interior depth tint
 const glassInner = new THREE.Mesh(
@@ -153,7 +154,7 @@ scene.add(glassOuter);
 
 // Rim halo — BackSide slightly oversized sphere gives Fresnel-ish edge glow
 const haloMesh = new THREE.Mesh(
-  new THREE.SphereGeometry(SPHERE_R * 1.018, 64, 64),
+  new THREE.SphereGeometry(SPHERE_R * 1.018, 48, 32),
   new THREE.MeshBasicMaterial({
     color: 0x5533cc,
     transparent: true,
@@ -272,56 +273,12 @@ function arcColor(t) {
   }
 }
 
-/**
- * Create a two-layer arc: a thin bright core + a wide transparent glow halo.
- * Both use additive blending so bloom handles perceived brightness, not fill opacity.
- * opacityMult scales both layers (use <1 for dimmed residual arcs).
- */
-function makeArcMesh(dir, coreR = 0.003, opacityMult = 1.0) {
-  const curve = buildArcCurve(dir);
-
-  function buildTube(radius, baseOpacity) {
-    const geo    = new THREE.TubeGeometry(curve, TUBULAR_SEGS, radius, RADIAL_SEGS, false);
-    const stride = RADIAL_SEGS + 1;
-    const cols   = new Float32Array(geo.attributes.position.count * 3);
-
-    for (let i = 0; i < geo.attributes.position.count; i++) {
-      const t = Math.floor(i / stride) / TUBULAR_SEGS;
-      const c = arcColor(t);
-      cols[i * 3]     = c.r;
-      cols[i * 3 + 1] = c.g;
-      cols[i * 3 + 2] = c.b;
-    }
-
-    geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
-
-    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
-      vertexColors: true,
-      transparent: true,
-      opacity: baseOpacity * opacityMult,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    }));
-    mesh.position.set(0, SPHERE_Y, 0);
-    return mesh;
-  }
-
-  const group = new THREE.Group();
-  group.add(buildTube(coreR,        0.75));  // sharp bright core
-  group.add(buildTube(coreR * 5.5,  0.04)); // wide feathery glow halo
-  return group;
-}
-
-// ─── Arc Group ────────────────────────────────────────────────────────────────
-
-const arcGroup = new THREE.Group();
-scene.add(arcGroup);
+// ─── Arc Pool (pre-allocated Lines, updated in-place) ─────────────────────────
 
 let attractDir = null; // normalized direction when user holds click
 
 /**
  * Return a direction within a cone of half-angle `spread` (radians) around `base`.
- * spread=0 → exact direction. Used to bundle attracted arcs without making them identical.
  */
 function jitteredDir(base, spread) {
   const d = base.clone().normalize();
@@ -334,37 +291,64 @@ function jitteredDir(base, spread) {
   return d.normalize();
 }
 
-function regenerateArcs() {
-  arcGroup.clear();
+// Create all arc Lines once — buffers reused every frame, no allocation at runtime
+const arcPool = Array.from({ length: TOTAL_ARCS }, () => {
+  const geo      = new THREE.BufferGeometry();
+  const posArr   = new Float32Array(ARC_PTS * 3);
+  const colArr   = new Float32Array(ARC_PTS * 3);
+  const posAttr  = new THREE.BufferAttribute(posArr, 3);
+  const colAttr  = new THREE.BufferAttribute(colArr, 3);
+  posAttr.usage  = THREE.DynamicDrawUsage;
+  colAttr.usage  = THREE.DynamicDrawUsage;
+  geo.setAttribute('position', posAttr);
+  geo.setAttribute('color',    colAttr);
 
-  // When attracting: 80% of arcs follow the cursor, 20% stay random but dimmed.
-  // Without attraction everything is random at full brightness.
-  const total     = NUM_ARCS + NUM_THIN_ARCS; // 11
-  const attracted = attractDir ? Math.round(total * 0.8) : 0; // 9 when holding
-  const DIM       = 0.28; // opacityMult for residual random arcs
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  }));
+  line.position.set(0, SPHERE_Y, 0);
+  line.frustumCulled = false; // always inside view — skip bounding check
+  scene.add(line);
+  return line;
+});
 
-  let assigned = 0;
+/**
+ * Rewrite one arc's buffers in-place — zero allocation.
+ * First ATTRACTED_COUNT indices are the "attracted" slots when holding.
+ */
+function refreshArc(i) {
+  const isThick    = i < NUM_ARCS;
+  const isAttracted = attractDir && i < ATTRACTED_COUNT;
+  const isDimmed   = attractDir && !isAttracted;
+  const spread     = isThick ? 0.13 : 0.22;
+  const brightMult = isDimmed ? 0.28 : (isThick ? 1.0 : 0.65);
 
-  for (let i = 0; i < NUM_ARCS; i++) {
-    if (attractDir && assigned < attracted) {
-      arcGroup.add(makeArcMesh(jitteredDir(attractDir, 0.13), 0.004));
-      assigned++;
-    } else {
-      arcGroup.add(makeArcMesh(randomDir(), 0.004, attractDir ? DIM : 1.0));
-    }
+  const dir  = isAttracted ? jitteredDir(attractDir, spread) : randomDir();
+  const pts  = buildArcCurve(dir).getPoints(ARC_PTS - 1);
+  const posArr = arcPool[i].geometry.attributes.position.array;
+  const colArr = arcPool[i].geometry.attributes.color.array;
+
+  for (let j = 0; j < ARC_PTS; j++) {
+    const t = j / (ARC_PTS - 1);
+    const c = arcColor(t);
+    const k = j * 3;
+    posArr[k]     = pts[j].x;
+    posArr[k + 1] = pts[j].y;
+    posArr[k + 2] = pts[j].z;
+    colArr[k]     = c.r * brightMult;
+    colArr[k + 1] = c.g * brightMult;
+    colArr[k + 2] = c.b * brightMult;
   }
 
-  for (let i = 0; i < NUM_THIN_ARCS; i++) {
-    if (attractDir && assigned < attracted) {
-      arcGroup.add(makeArcMesh(jitteredDir(attractDir, 0.22), 0.002));
-      assigned++;
-    } else {
-      arcGroup.add(makeArcMesh(randomDir(), 0.002, attractDir ? DIM : 1.0));
-    }
-  }
+  arcPool[i].geometry.attributes.position.needsUpdate = true;
+  arcPool[i].geometry.attributes.color.needsUpdate    = true;
 }
 
-regenerateArcs();
+// Seed all arcs before first render
+for (let i = 0; i < TOTAL_ARCS; i++) refreshArc(i);
 
 // ─── Mouse Interaction ────────────────────────────────────────────────────────
 
@@ -431,18 +415,17 @@ renderer.domElement.addEventListener('touchend', () => {
 
 // ─── Animation ────────────────────────────────────────────────────────────────
 
-const sphereCenter = new THREE.Vector3(0, SPHERE_Y, 0);
-let lastRegen = 0;
+let arcCursor = 0;
 
 function animate(ms) {
   requestAnimationFrame(animate);
 
   controls.update();
 
-  // Regen arcs on interval
-  if (ms - lastRegen > REGEN_MS) {
-    lastRegen = ms;
-    regenerateArcs();
+  // Stagger arc updates — ARCS_PER_FRAME per frame, round-robin, zero allocation
+  for (let k = 0; k < ARCS_PER_FRAME; k++) {
+    refreshArc(arcCursor % TOTAL_ARCS);
+    arcCursor++;
   }
 
   // Pulse inner light and core glow
